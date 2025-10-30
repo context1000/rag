@@ -1,6 +1,6 @@
 import "dotenv/config";
 
-import { ChromaClient } from "./chroma-client.js";
+import { QdrantClient } from "./qdrant-client.js";
 
 export interface QueryResult {
   document: string;
@@ -16,14 +16,14 @@ export interface QueryResult {
 }
 
 export class QueryInterface {
-  private chromaClient: ChromaClient;
+  private qdrantClient: QdrantClient;
 
   constructor() {
-    this.chromaClient = new ChromaClient();
+    this.qdrantClient = new QdrantClient();
   }
 
   async initialize(collectionName: string = "context1000", docsPath?: string): Promise<void> {
-    await this.chromaClient.initialize(collectionName, docsPath);
+    await this.qdrantClient.initialize(collectionName, docsPath);
   }
 
   async queryDocs(
@@ -53,7 +53,7 @@ export class QueryInterface {
     } else if (conditions.length === 1) {
       whereClause = conditions[0];
     }
-    const results = await this.chromaClient.queryDocuments(query, maxResults, whereClause);
+    const results = await this.qdrantClient.queryDocuments(query, maxResults, whereClause);
 
     return results.documents.map((doc, index) => ({
       document: doc,
@@ -61,8 +61,8 @@ export class QueryInterface {
         title: results.metadatas[index].title,
         type: results.metadatas[index].type,
         filePath: results.metadatas[index].filePath,
-        tags: JSON.parse(results.metadatas[index].tags || "[]"),
-        projects: JSON.parse(results.metadatas[index].projects || "[]"),
+        tags: results.metadatas[index].tags,
+        projects: results.metadatas[index].projects,
         status: results.metadatas[index].status,
       },
       relevanceScore: 1 - (results.distances[index] || 0),

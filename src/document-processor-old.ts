@@ -49,10 +49,8 @@ export interface ProcessedDocument {
 }
 
 export class DocumentProcessor {
-  // Optimized for text-embedding-3-small (8191 token context)
-  // 1200 tokens balances context richness with retrieval precision
-  private readonly MAX_CHUNK_TOKENS = 1200;
-  private readonly OVERLAP_TOKENS = 200; // ~17% overlap
+  private readonly MAX_CHUNK_TOKENS = 800;
+  private readonly OVERLAP_TOKENS = 150;
 
   async processDocuments(docsPath: string): Promise<ProcessedDocument[]> {
     const documents: ProcessedDocument[] = [];
@@ -134,7 +132,6 @@ export class DocumentProcessor {
       chunkIndex += sectionChunks.length;
     }
 
-    // Update totalChunks for all chunks
     chunks.forEach((chunk) => {
       chunk.metadata.totalChunks = chunks.length;
     });
@@ -176,48 +173,13 @@ export class DocumentProcessor {
   }
 
   private inferSectionType(title: string): string {
-    const lower = title.toLowerCase();
-
-    // Context/Problem/Background
-    if (/(context|problem|background|motivation|rationale|why)/i.test(lower)) {
-      return "context";
-    }
-
-    // Decision/Solution/Approach
-    if (/(decision|solution|approach|proposal|chosen)/i.test(lower)) {
-      return "decision";
-    }
-
-    // Consequences/Impact/Trade-offs
-    if (/(consequence|impact|tradeoff|implication|effect)/i.test(lower)) {
-      return "consequences";
-    }
-
-    // Alternatives/Options
-    if (/(alternative|option|considered|comparison|rejected)/i.test(lower)) {
-      return "alternatives";
-    }
-
-    // Implementation/Plan/Rollout
-    if (/(implementation|plan|rollout|migration|deploy|schedule)/i.test(lower)) {
-      return "implementation";
-    }
-
-    // Summary/Overview
-    if (/(summary|overview|tldr|abstract|intro)/i.test(lower)) {
-      return "summary";
-    }
-
-    // Metrics/Success Criteria
-    if (/(metric|measure|success|criteria|kpi)/i.test(lower)) {
-      return "metrics";
-    }
-
-    // Risks/Concerns
-    if (/(risk|concern|question|issue|challenge)/i.test(lower)) {
-      return "risks";
-    }
-
+    const lowerTitle = title.toLowerCase();
+    if (lowerTitle.includes("context")) return "context";
+    if (lowerTitle.includes("decision")) return "decision";
+    if (lowerTitle.includes("consequence")) return "consequences";
+    if (lowerTitle.includes("summary")) return "summary";
+    if (lowerTitle.includes("background")) return "background";
+    if (lowerTitle.includes("implementation")) return "implementation";
     return "content";
   }
 
@@ -229,176 +191,93 @@ export class DocumentProcessor {
   ): DocumentChunk[] {
     const tokens = this.estimateTokens(section.content);
 
-    // If section fits in one chunk, return it with document title context
     if (tokens <= this.MAX_CHUNK_TOKENS) {
-      const contentWithContext = this.addDocumentContext(section.content, baseMetadata.title, section.title);
-
       return [
         {
           id: `${documentId}_chunk_${startIndex}`,
-          content: contentWithContext,
+          content: section.content.trim(),
           metadata: {
             ...baseMetadata,
             chunkIndex: startIndex,
-            totalChunks: 0, // Updated later
+            totalChunks: 0,
             sectionType: section.type,
             sectionTitle: section.title,
-            tokens: this.estimateTokens(contentWithContext),
+            tokens,
           },
         },
       ];
     }
 
-    // Split large sections using sentence-aware strategy
-    return this.splitLargeSectionSentenceAware(section, documentId, startIndex, baseMetadata);
+    return this.splitLargeSection(section, documentId, startIndex, baseMetadata);
   }
 
-  private addDocumentContext(content: string, documentTitle: string, sectionTitle: string): string {
-    // Add document title for context
-    // Section title is already in the content (extracted with the heading)
-    // This helps the LLM understand what document the chunk belongs to
-    return `# ${documentTitle}\n\n${content.trim()}`;
-  }
-
-  private splitLargeSectionSentenceAware(
+  private splitLargeSection(
     section: { title: string; content: string; type: string },
     documentId: string,
     startIndex: number,
     baseMetadata: any
   ): DocumentChunk[] {
     const chunks: DocumentChunk[] = [];
+    const words = section.content.split(/\s+/);
+    const wordsPerChunk = Math.floor(this.MAX_CHUNK_TOKENS * 0.75);
+    const overlapWords = Math.floor(this.OVERLAP_TOKENS * 0.75);
 
-    // Split into sentences (handles common abbreviations)
-    const sentences = this.splitIntoSentences(section.content);
-
-    let currentChunk = "";
     let currentIndex = startIndex;
 
-    for (const sentence of sentences) {
-      const testChunk = currentChunk ? currentChunk + " " + sentence : sentence;
-      const testTokens = this.estimateTokens(testChunk);
-
-      if (testTokens > this.MAX_CHUNK_TOKENS && currentChunk) {
-        // Save current chunk with document context
-        const contentWithContext = this.addDocumentContext(currentChunk, baseMetadata.title, section.title);
-
-        chunks.push({
-          id: `${documentId}_chunk_${currentIndex}`,
-          content: contentWithContext,
-          metadata: {
-            ...baseMetadata,
-            chunkIndex: currentIndex,
-            totalChunks: 0, // Updated later
-            sectionType: section.type,
-            sectionTitle: section.title,
-            tokens: this.estimateTokens(contentWithContext),
-          },
-        });
-
-        // Start new chunk with overlap
-        const overlapText = this.getLastNTokensOfText(currentChunk, this.OVERLAP_TOKENS);
-        currentChunk = overlapText + " " + sentence;
-        currentIndex++;
-      } else {
-        currentChunk = testChunk;
-      }
-    }
-
-    // Add final chunk
-    if (currentChunk.trim()) {
-      const contentWithContext = this.addDocumentContext(currentChunk, baseMetadata.title, section.title);
+    for (let i = 0; i < words.length; i += wordsPerChunk - overlapWords) {
+      const chunkWords = words.slice(i, i + wordsPerChunk);
+      const chunkContent = chunkWords.join(" ");
+      const tokens = this.estimateTokens(chunkContent);
 
       chunks.push({
         id: `${documentId}_chunk_${currentIndex}`,
-        content: contentWithContext,
+        content: chunkContent,
         metadata: {
           ...baseMetadata,
           chunkIndex: currentIndex,
-          totalChunks: 0, // Updated later
+          totalChunks: 0,
           sectionType: section.type,
           sectionTitle: section.title,
-          tokens: this.estimateTokens(contentWithContext),
+          tokens,
         },
       });
+
+      currentIndex++;
     }
 
     return chunks;
   }
 
-  private splitIntoSentences(text: string): string[] {
-    // Split on sentence boundaries, handling common abbreviations
-    // Matches: . ! ? followed by space or newline
-    // Avoids splitting on: Dr. Mr. Ms. Mrs. vs. e.g. i.e. etc.
-    const sentences = text.match(/[^.!?\n]+(?:[.!?](?![\s\n])|[.!?](?=[\s\n](?:[A-Z]|$)))/g) || [text];
-
-    return sentences.map((s) => s.trim()).filter((s) => s.length > 0);
-  }
-
-  private getLastNTokensOfText(text: string, maxTokens: number): string {
-    // Get last N tokens by estimating from the end
-    const sentences = this.splitIntoSentences(text);
-    let result = "";
-    let tokens = 0;
-
-    // Add sentences from the end until we reach maxTokens
-    for (let i = sentences.length - 1; i >= 0 && tokens < maxTokens; i--) {
-      const testResult = sentences[i] + " " + result;
-      const testTokens = this.estimateTokens(testResult);
-
-      if (testTokens > maxTokens) {
-        break;
-      }
-
-      result = testResult;
-      tokens = testTokens;
-    }
-
-    return result.trim();
-  }
-
   private estimateTokens(text: string): number {
-    // Character count / 4 is ~95% accurate for English text
-    // This accounts for:
-    // - Average English word length: ~4.7 characters
-    // - Spaces and punctuation
-    // - Subword tokenization (GPT uses BPE)
-    //
-    // Reference: OpenAI tokenization averages ~4 chars per token
-    // For text-embedding-3-small, this is accurate within 5%
-    return Math.ceil(text.length / 4);
+    return Math.ceil(text.split(/\s+/).length * 1.3);
   }
 
   private inferDocumentType(filePath: string, _frontmatter: any): ProcessedDocument["metadata"]["type"] {
     const fileName = path.basename(filePath);
     const normalizedPath = filePath.replace(/\\/g, "/");
 
-    // File extension-based detection
     if (fileName.endsWith(".adr.md")) return "adr";
     if (fileName.endsWith(".rfc.md")) return "rfc";
     if (fileName.endsWith(".guide.md")) return "guide";
     if (fileName.endsWith(".rules.md")) return "rule";
 
-    // Path-based detection
     if (normalizedPath.match(/\/decisions\/adr\//)) return "adr";
     if (normalizedPath.match(/\/decisions\/rfc\//)) return "rfc";
     if (normalizedPath.match(/\/guides\//)) return "guide";
     if (normalizedPath.match(/\/rules\//)) return "rule";
 
-    // Project detection
     if (fileName === "project.md" && normalizedPath.includes("/projects/")) return "project";
+
     if (normalizedPath.match(/\/projects\/[^\/]+\/[^\/]*\.md$/)) return "project";
 
-    // Default fallback
     return "guide";
   }
 
   private extractProjectsArray(frontmatter: any, filePath: string): string[] {
-    // Check frontmatter first
     if (frontmatter.related?.projects && Array.isArray(frontmatter.related.projects)) {
       return frontmatter.related.projects;
     }
 
-    // Extract from path
     const projectMatch = filePath.match(/\/projects\/([^\/]+)/);
     if (projectMatch) {
       return [projectMatch[1]];
@@ -421,7 +300,6 @@ export class DocumentProcessor {
   }
 
   private extractTitle(frontmatter: any, filePath: string): string {
-    // Priority: frontmatter.title > frontmatter.name > filename
     if (frontmatter.title && typeof frontmatter.title === "string") {
       return frontmatter.title;
     }
@@ -437,11 +315,11 @@ export class DocumentProcessor {
     }
 
     const validStatuses: Record<string, string[]> = {
-      adr: ["draft", "accepted", "rejected", "deprecated", "superseded"],
-      rfc: ["draft", "review", "accepted", "rejected", "implemented"],
+      adr: ["draft", "accepted", "rejected"],
+      rfc: ["draft", "accepted", "rejected"],
       guide: [],
       rule: [],
-      project: ["active", "inactive", "archived", "planning"],
+      project: ["active", "inactive", "archived"],
     };
 
     const allowedStatuses = validStatuses[type] || [];
@@ -449,7 +327,7 @@ export class DocumentProcessor {
       return status;
     }
 
-    return allowedStatuses.includes(status.toLowerCase()) ? status : undefined;
+    return allowedStatuses.includes(status) ? status : undefined;
   }
 
   private generateDocumentId(filePath: string): string {

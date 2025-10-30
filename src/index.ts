@@ -4,7 +4,7 @@ import "dotenv/config";
 import { Command } from "commander";
 import path from "path";
 import { DocumentProcessor } from "./document-processor.js";
-import { ChromaClient } from "./chroma-client.js";
+import { QdrantClient } from "./qdrant-client.js";
 import { QueryResult } from "./query.js";
 import packageJson from "../package.json";
 import { createServer } from "http";
@@ -39,15 +39,15 @@ program
         return;
       }
 
-      const chromaClient = new ChromaClient();
-      await chromaClient.initialize("context1000");
+      const qdrantClient = new QdrantClient();
+      await qdrantClient.initialize("context1000");
 
-      await chromaClient.deleteCollection("context1000");
-      await chromaClient.initialize("context1000");
+      await qdrantClient.deleteCollection("context1000");
+      await qdrantClient.initialize("context1000");
 
-      await chromaClient.addDocuments(chunks);
+      await qdrantClient.addDocuments(chunks);
 
-      const info = await chromaClient.getCollectionInfo();
+      const info = await qdrantClient.getCollectionInfo();
       console.log("Collection info:", info);
 
       console.log("Document indexing completed successfully!");

@@ -68,8 +68,8 @@ jspm_packages/
 ehthumbs.db
 Thumbs.db
 
-# ChromaDB data
-chroma_data/
+# Qdrant data
+qdrant_data/
 *.db
 *.sqlite
 
