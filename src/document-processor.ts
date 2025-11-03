@@ -24,6 +24,21 @@ export interface DocumentChunk {
       rfcs?: string[];
       guides?: string[];
       rules?: string[];
+      projects?: string[];
+      "depends-on"?: {
+        adrs?: string[];
+        rfcs?: string[];
+        guides?: string[];
+        rules?: string[];
+        projects?: string[];
+      };
+      supersedes?: {
+        adrs?: string[];
+        rfcs?: string[];
+        guides?: string[];
+        rules?: string[];
+        projects?: string[];
+      };
     };
   };
 }
@@ -44,6 +59,21 @@ export interface ProcessedDocument {
       rfcs?: string[];
       guides?: string[];
       rules?: string[];
+      projects?: string[];
+      "depends-on"?: {
+        adrs?: string[];
+        rfcs?: string[];
+        guides?: string[];
+        rules?: string[];
+        projects?: string[];
+      };
+      supersedes?: {
+        adrs?: string[];
+        rfcs?: string[];
+        guides?: string[];
+        rules?: string[];
+        projects?: string[];
+      };
     };
   };
 }
@@ -410,10 +440,37 @@ export class DocumentProcessor {
   private validateRelatedMetadata(related: any): any {
     const validatedRelated: any = {};
 
+    // Simple reference links
     const allowedKeys = ["adrs", "rfcs", "guides", "rules", "projects"];
     for (const key of allowedKeys) {
       if (related[key] && Array.isArray(related[key])) {
         validatedRelated[key] = related[key];
+      }
+    }
+
+    // Directed graph links: depends-on
+    if (related["depends-on"] && typeof related["depends-on"] === "object") {
+      const dependsOn: any = {};
+      for (const key of allowedKeys) {
+        if (related["depends-on"][key] && Array.isArray(related["depends-on"][key])) {
+          dependsOn[key] = related["depends-on"][key];
+        }
+      }
+      if (Object.keys(dependsOn).length > 0) {
+        validatedRelated["depends-on"] = dependsOn;
+      }
+    }
+
+    // Directed graph links: supersedes
+    if (related["supersedes"] && typeof related["supersedes"] === "object") {
+      const supersedes: any = {};
+      for (const key of allowedKeys) {
+        if (related["supersedes"][key] && Array.isArray(related["supersedes"][key])) {
+          supersedes[key] = related["supersedes"][key];
+        }
+      }
+      if (Object.keys(supersedes).length > 0) {
+        validatedRelated["supersedes"] = supersedes;
       }
     }
 
