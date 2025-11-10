@@ -13,6 +13,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { QueryInterface, QueryResult } from "./query.js";
 import packageJson from "../package.json";
+import { readFile } from "fs/promises";
+import matter from "gray-matter";
 
 const COLLECTION_NAME = "context1000";
 const DEFAULT_PORT = 3000;
@@ -36,6 +38,17 @@ interface ToolArgs {
   related_rules?: string[];
   references?: string[];
   type_filter?: string[];
+  draft_title?: string;
+  draft_type?: string;
+  draft_summary?: string;
+  min_similarity?: number;
+  id?: string;
+  name?: string;
+  slug?: string;
+  type?: string;
+  include_content?: boolean;
+  include_frontmatter?: boolean;
+  include_raw?: boolean;
 }
 
 // Tool definitions extracted to constants for reusability
@@ -155,6 +168,81 @@ const TOOLS: Tool[] = [
       required: ["query"],
     },
   },
+  {
+    name: "find_similar_documents",
+    description:
+      "Find existing documents similar to a proposed new or updated document to avoid duplicates and choose between update vs create.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        draft_title: {
+          type: "string",
+          description: "Title or name of the proposed document (rule/ADR/guide/etc).",
+        },
+        draft_type: {
+          type: "string",
+          enum: ["rule", "guide", "adr", "rfc", "project", "other"],
+          description: "Intended document type.",
+        },
+        draft_summary: {
+          type: "string",
+          description: "Short summary or key requirements/ideas of the proposed document.",
+        },
+        max_results: {
+          type: "number",
+          description: "Maximum number of similar documents to return (default: 5)",
+          minimum: 1,
+          maximum: 10,
+        },
+        min_similarity: {
+          type: "number",
+          description: "Optional similarity threshold (0-1). Below this, results should be considered unrelated.",
+          minimum: 0,
+          maximum: 1,
+        },
+      },
+      required: ["draft_summary"],
+    },
+  },
+  {
+    name: "get_document",
+    description:
+      "Fetch a full canonical document by its stable identifier (id/name/slug) instead of chunks. Use this after search_* or find_similar_documents to read or update the actual source document (including frontmatter).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Stable document identifier (preferred). Usually matches frontmatter 'name' or internal doc_id returned by other tools.",
+        },
+        name: {
+          type: "string",
+          description: "Frontmatter 'name' if used as canonical ID. Use if 'id' is not provided.",
+        },
+        slug: {
+          type: "string",
+          description: "Document slug (e.g. '/rules/all-apis-must-implement-rate-limiting.rule/'). Use as fallback if id/name unknown.",
+        },
+        type: {
+          type: "string",
+          enum: ["rule", "guide", "adr", "rfc", "project", "other"],
+          description: "Optional document type to disambiguate when multiple docs share similar identifiers.",
+        },
+        include_content: {
+          type: "boolean",
+          description: "If true, returns full document content (Markdown body). Default: true.",
+        },
+        include_frontmatter: {
+          type: "boolean",
+          description: "If true, returns parsed frontmatter (name, title, tags, related, etc.). Default: true.",
+        },
+        include_raw: {
+          type: "boolean",
+          description: "If true, also returns raw source as-is (e.g. full markdown file text). Useful for precise edits. Default: false.",
+        },
+      },
+    },
+  },
 ];
 
 // Utility functions
@@ -270,6 +358,130 @@ async function handleSearchDocumentation(rag: QueryInterface, args: ToolArgs) {
       args.type_filter?.length ? ` (types: ${args.type_filter.join(", ")})` : ""
     }`,
   });
+}
+
+async function handleFindSimilarDocuments(rag: QueryInterface, args: ToolArgs) {
+  if (!args.draft_summary) {
+    throw new McpError(ErrorCode.InvalidParams, "draft_summary is required");
+  }
+
+  const queryParts = [];
+  if (args.draft_title) {
+    queryParts.push(args.draft_title);
+  }
+  queryParts.push(args.draft_summary);
+  const query = queryParts.join(" ");
+
+  const options: QueryOptions = {
+    maxResults: args.max_results ?? 5,
+  };
+
+  if (args.draft_type && args.draft_type !== "other") {
+    options.filterByType = [args.draft_type];
+  }
+
+  const results = await rag.queryDocs(query, options);
+
+  const minSimilarity = args.min_similarity ?? 0.7;
+
+  return formatToolResponse({
+    similar_documents: results,
+    found_count: results.length,
+    min_similarity_threshold: minSimilarity,
+    draft_info: {
+      title: args.draft_title,
+      type: args.draft_type,
+      summary: args.draft_summary,
+    },
+    summary: `Found ${results.length} similar ${args.draft_type || "document"}${
+      results.length !== 1 ? "s" : ""
+    } for "${args.draft_title || args.draft_summary.substring(0, 50)}..."`,
+    recommendation:
+      results.length > 0
+        ? "Review these documents to determine if update or new creation is needed"
+        : "No similar documents found - safe to create new document",
+  });
+}
+
+async function handleGetDocument(rag: QueryInterface, args: ToolArgs) {
+  // Validate at least one identifier is provided
+  if (!args.id && !args.name && !args.slug) {
+    throw new McpError(ErrorCode.InvalidParams, "At least one of id, name, or slug is required");
+  }
+
+  // Build query to find the document
+  const searchTerms = [args.id, args.name, args.slug].filter((term): term is string => Boolean(term));
+  const query = searchTerms.join(" ");
+
+  // Search for the document
+  const options: QueryOptions = {
+    maxResults: 5,
+  };
+
+  if (args.type && args.type !== "other") {
+    options.filterByType = [args.type];
+  }
+
+  const results = await rag.queryDocs(query, options);
+
+  if (results.length === 0) {
+    throw new McpError(ErrorCode.InvalidRequest, `No document found matching: ${query}`);
+  }
+
+  // Get the best match (first result)
+  const document = results[0];
+  const filePath = document.metadata.filePath;
+
+  if (!filePath) {
+    throw new McpError(ErrorCode.InternalError, "Document has no associated file path");
+  }
+
+  // Read the file from disk
+  let fileContent: string;
+  try {
+    fileContent = await readFile(filePath, "utf-8");
+  } catch (error) {
+    throw new McpError(ErrorCode.InternalError, `Failed to read file at ${filePath}: ${error}`);
+  }
+
+  // Parse frontmatter and content
+  const parsed = matter(fileContent);
+
+  // Prepare response based on include flags
+  const includeContent = args.include_content !== false;
+  const includeFrontmatter = args.include_frontmatter !== false;
+  const includeRaw = args.include_raw === true;
+
+  const response: Record<string, unknown> = {
+    identifier: {
+      id: args.id,
+      name: args.name || parsed.data.name,
+      slug: args.slug,
+    },
+    file_path: filePath,
+    document_type: document.metadata.type,
+  };
+
+  if (includeFrontmatter) {
+    response.frontmatter = parsed.data;
+  }
+
+  if (includeContent) {
+    response.content = parsed.content;
+  }
+
+  if (includeRaw) {
+    response.raw = fileContent;
+  }
+
+  response.metadata = {
+    title: document.metadata.title,
+    projects: document.metadata.projects,
+    tags: document.metadata.tags,
+    status: document.metadata.status,
+  };
+
+  return formatToolResponse(response);
 }
 
 // HTTP routing helpers
@@ -458,6 +670,10 @@ async function setupMCPServer(): Promise<Server> {
           return await handleSearchDecisions(rag, args as ToolArgs);
         case "search_documentation":
           return await handleSearchDocumentation(rag, args as ToolArgs);
+        case "find_similar_documents":
+          return await handleFindSimilarDocuments(rag, args as ToolArgs);
+        case "get_document":
+          return await handleGetDocument(rag, args as ToolArgs);
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }

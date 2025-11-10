@@ -93,10 +93,11 @@ export class DocumentProcessor {
   // 1200 tokens balances context richness with retrieval precision
   private readonly MAX_CHUNK_TOKENS = 1200;
   private readonly OVERLAP_TOKENS = 200; // ~17% overlap
+  private readonly MAX_RECURSION_DEPTH = 50; // Prevent stack overflow
 
   async processDocuments(docsPath: string): Promise<ProcessedDocument[]> {
     const documents: ProcessedDocument[] = [];
-    await this.processDirectory(docsPath, documents);
+    await this.processDirectory(docsPath, documents, 0);
     return documents;
   }
 
@@ -105,14 +106,19 @@ export class DocumentProcessor {
     return documents.flatMap((doc) => doc.chunks);
   }
 
-  private async processDirectory(dirPath: string, documents: ProcessedDocument[]): Promise<void> {
+  private async processDirectory(dirPath: string, documents: ProcessedDocument[], depth: number): Promise<void> {
+    if (depth > this.MAX_RECURSION_DEPTH) {
+      console.warn(`Max recursion depth ${this.MAX_RECURSION_DEPTH} exceeded at ${dirPath}`);
+      return;
+    }
+
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
       const fullPath = path.join(dirPath, entry.name);
 
       if (entry.isDirectory()) {
-        await this.processDirectory(fullPath, documents);
+        await this.processDirectory(fullPath, documents, depth + 1);
       } else if (entry.name.endsWith(".md") && !entry.name.startsWith("_")) {
         try {
           const doc = await this.processMarkdownFile(fullPath);
@@ -168,40 +174,58 @@ export class DocumentProcessor {
       chunkIndex += sectionChunks.length;
     }
 
-    // Update totalChunks for all chunks
+    // Update totalChunks in-place (avoid creating new objects)
     const totalChunks = chunks.length;
-    return chunks.map((chunk) => ({
-      ...chunk,
-      metadata: { ...chunk.metadata, totalChunks },
-    }));
+    for (const chunk of chunks) {
+      chunk.metadata.totalChunks = totalChunks;
+    }
+
+    return chunks;
   }
 
   private extractSections(content: string): Section[] {
     const sections: Section[] = [];
     const lines = content.split("\n");
-    let currentSection: Section = { title: "", content: "", type: "content" };
+    let currentLines: string[] = [];
+    let currentTitle = "";
+    let currentType = "content";
 
     for (const line of lines) {
       const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
 
       if (headingMatch) {
-        if (currentSection.content.trim()) {
-          sections.push(currentSection);
+        // Save previous section
+        if (currentLines.length > 0) {
+          const sectionContent = currentLines.join("\n");
+          if (sectionContent.trim()) {
+            sections.push({
+              title: currentTitle,
+              content: sectionContent,
+              type: currentType,
+            });
+          }
         }
 
+        // Start new section
         const title = headingMatch[2];
-        currentSection = {
-          title,
-          content: line + "\n",
-          type: this.inferSectionType(title),
-        };
+        currentTitle = title;
+        currentType = this.inferSectionType(title);
+        currentLines = [line];
       } else {
-        currentSection.content += line + "\n";
+        currentLines.push(line);
       }
     }
 
-    if (currentSection.content.trim()) {
-      sections.push(currentSection);
+    // Push final section
+    if (currentLines.length > 0) {
+      const sectionContent = currentLines.join("\n");
+      if (sectionContent.trim()) {
+        sections.push({
+          title: currentTitle,
+          content: sectionContent,
+          type: currentType,
+        });
+      }
     }
 
     return sections.length > 0 ? sections : [{ title: "Content", content, type: "content" }];
@@ -243,7 +267,7 @@ export class DocumentProcessor {
     baseMetadata: BaseMetadata,
     content: string
   ): DocumentChunk {
-    const contentWithContext = this.addDocumentContext(content, baseMetadata.title, section.title);
+    const contentWithContext = this.addDocumentContext(content, baseMetadata.title);
 
     return {
       id: `${documentId}_chunk_${chunkIndex}`,
@@ -259,7 +283,7 @@ export class DocumentProcessor {
     };
   }
 
-  private addDocumentContext(content: string, documentTitle: string, sectionTitle: string): string {
+  private addDocumentContext(content: string, documentTitle: string): string {
     // Add document title for context
     // Section title is already in the content (extracted with the heading)
     // This helps the LLM understand what document the chunk belongs to
@@ -275,58 +299,87 @@ export class DocumentProcessor {
     const chunks: DocumentChunk[] = [];
     const sentences = this.splitIntoSentences(section.content);
 
-    let currentChunk = "";
+    const currentParts: string[] = [];
     let currentIndex = startIndex;
+    let currentTokens = 0;
 
     for (const sentence of sentences) {
-      const testChunk = currentChunk ? `${currentChunk} ${sentence}` : sentence;
-      const testTokens = this.estimateTokens(testChunk);
+      const sentenceTokens = this.estimateTokens(sentence);
+      const projectedTokens = currentTokens + sentenceTokens + (currentParts.length > 0 ? 1 : 0); // +1 for space
 
-      if (testTokens > this.MAX_CHUNK_TOKENS && currentChunk) {
+      if (projectedTokens > this.MAX_CHUNK_TOKENS && currentParts.length > 0) {
         // Save current chunk
-        chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, currentChunk));
+        const chunkContent = currentParts.join(" ");
+        chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, chunkContent));
 
         // Start new chunk with overlap
-        const overlapText = this.getLastNTokensOfText(currentChunk, this.OVERLAP_TOKENS);
-        currentChunk = `${overlapText} ${sentence}`;
+        const overlapText = this.getLastNTokensOfText(chunkContent, this.OVERLAP_TOKENS);
+        currentParts.length = 0;
+        currentParts.push(overlapText, sentence);
+        currentTokens = this.estimateTokens(overlapText) + sentenceTokens + 1;
         currentIndex++;
       } else {
-        currentChunk = testChunk;
+        currentParts.push(sentence);
+        currentTokens = projectedTokens;
       }
     }
 
     // Add final chunk
-    if (currentChunk.trim()) {
-      chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, currentChunk));
+    if (currentParts.length > 0) {
+      const chunkContent = currentParts.join(" ");
+      if (chunkContent.trim()) {
+        chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, chunkContent));
+      }
     }
 
     return chunks;
   }
 
   private splitIntoSentences(text: string): string[] {
-    const sentences = text.match(SENTENCE_SPLIT_REGEX) || [text];
-    return sentences.map((s) => s.trim()).filter((s) => s.length > 0);
+    const matches = text.match(SENTENCE_SPLIT_REGEX);
+    if (!matches) {
+      return [text];
+    }
+
+    // Single pass: trim and filter in one loop
+    const result: string[] = [];
+    for (const sentence of matches) {
+      const trimmed = sentence.trim();
+      if (trimmed.length > 0) {
+        result.push(trimmed);
+      }
+    }
+    return result;
   }
 
   private getLastNTokensOfText(text: string, maxTokens: number): string {
     const sentences = this.splitIntoSentences(text);
-    let result = "";
-    let tokens = 0;
+    const resultParts: string[] = [];
+    let currentTokens = 0;
 
     // Add sentences from the end until we reach maxTokens
-    for (let i = sentences.length - 1; i >= 0 && tokens < maxTokens; i--) {
-      const testResult = `${sentences[i]} ${result}`;
-      const testTokens = this.estimateTokens(testResult);
+    for (let i = sentences.length - 1; i >= 0; i--) {
+      const sentence = sentences[i];
+      const sentenceTokens = this.estimateTokens(sentence);
+
+      // Calculate tokens if we add this sentence
+      const testTokens = currentTokens + sentenceTokens + (resultParts.length > 0 ? 1 : 0);
 
       if (testTokens > maxTokens) {
+        // Only break if we already have some content
+        if (resultParts.length > 0) {
+          break;
+        }
+        // If no content yet, take at least one sentence even if it exceeds limit
+        resultParts.unshift(sentence);
         break;
       }
 
-      result = testResult;
-      tokens = testTokens;
+      resultParts.unshift(sentence);
+      currentTokens = testTokens;
     }
 
-    return result.trim();
+    return resultParts.join(" ").trim();
   }
 
   private estimateTokens(text: string): number {
@@ -343,23 +396,26 @@ export class DocumentProcessor {
 
   private inferDocumentType(filePath: string): DocumentType {
     const fileName = path.basename(filePath);
-    const normalizedPath = filePath.replace(/\\/g, "/");
 
-    // File extension-based detection
+    // File extension-based detection (fastest check)
     if (fileName.endsWith(".adr.md")) return "adr";
     if (fileName.endsWith(".rfc.md")) return "rfc";
     if (fileName.endsWith(".guide.md")) return "guide";
     if (fileName.endsWith(".rules.md")) return "rule";
 
-    // Path-based detection
-    if (normalizedPath.match(/\/decisions\/adr\//)) return "adr";
-    if (normalizedPath.match(/\/decisions\/rfc\//)) return "rfc";
-    if (normalizedPath.match(/\/guides\//)) return "guide";
-    if (normalizedPath.match(/\/rules\//)) return "rule";
+    // Normalize path only if needed (lazy evaluation)
+    const normalizedPath = filePath.includes("\\") ? filePath.replace(/\\/g, "/") : filePath;
 
-    // Project detection
+    // Path-based detection
+    if (normalizedPath.includes("/decisions/adr/")) return "adr";
+    if (normalizedPath.includes("/decisions/rfc/")) return "rfc";
+    if (normalizedPath.includes("/guides/")) return "guide";
+    if (normalizedPath.includes("/rules/")) return "rule";
+
+    // Project detection (must be exactly "project.md" or in a project subdirectory)
     if (fileName === "project.md" && normalizedPath.includes("/projects/")) return "project";
-    if (normalizedPath.match(/\/projects\/[^\/]+\/[^\/]*\.md$/)) return "project";
+    // Match files like /projects/my-project/some-doc.md but not /projects/index.md
+    if (normalizedPath.match(/\/projects\/[^\/]+\/.+\.md$/)) return "project";
 
     // Default fallback
     return "guide";

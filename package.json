@@ -31,6 +31,8 @@
   ],
   "scripts": {
     "build": "tsup",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "test:watch": "node --import tsx --test --watch src/**/*.test.ts",
     "prepublishOnly": "npm run build"
   },
   "module": "./dist/index.js",
