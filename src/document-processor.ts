@@ -4,79 +4,89 @@ import fs from "fs-extra";
 import path from "path";
 import matter from "gray-matter";
 
+export type DocumentType = "adr" | "rfc" | "guide" | "rule" | "project";
+
+export interface RelatedMetadata {
+  adrs?: string[];
+  rfcs?: string[];
+  guides?: string[];
+  rules?: string[];
+  projects?: string[];
+  "depends-on"?: {
+    adrs?: string[];
+    rfcs?: string[];
+    guides?: string[];
+    rules?: string[];
+    projects?: string[];
+  };
+  supersedes?: {
+    adrs?: string[];
+    rfcs?: string[];
+    guides?: string[];
+    rules?: string[];
+    projects?: string[];
+  };
+}
+
+export interface BaseMetadata {
+  title: string;
+  type: DocumentType;
+  tags: string[];
+  projects: string[];
+  status?: string;
+  filePath: string;
+  related?: RelatedMetadata;
+}
+
+export interface ChunkMetadata extends BaseMetadata {
+  chunkIndex: number;
+  totalChunks: number;
+  sectionType?: string;
+  sectionTitle?: string;
+  tokens: number;
+}
+
 export interface DocumentChunk {
   id: string;
   content: string;
-  metadata: {
-    title: string;
-    type: "adr" | "rfc" | "guide" | "rule" | "project";
-    tags: string[];
-    projects: string[];
-    status?: string;
-    filePath: string;
-    chunkIndex: number;
-    totalChunks: number;
-    sectionType?: string;
-    sectionTitle?: string;
-    tokens: number;
-    related?: {
-      adrs?: string[];
-      rfcs?: string[];
-      guides?: string[];
-      rules?: string[];
-      projects?: string[];
-      "depends-on"?: {
-        adrs?: string[];
-        rfcs?: string[];
-        guides?: string[];
-        rules?: string[];
-        projects?: string[];
-      };
-      supersedes?: {
-        adrs?: string[];
-        rfcs?: string[];
-        guides?: string[];
-        rules?: string[];
-        projects?: string[];
-      };
-    };
-  };
+  metadata: ChunkMetadata;
 }
 
 export interface ProcessedDocument {
   id: string;
   content: string;
   chunks: DocumentChunk[];
-  metadata: {
-    title: string;
-    type: "adr" | "rfc" | "guide" | "rule" | "project";
-    tags: string[];
-    projects: string[];
-    status?: string;
-    filePath: string;
-    related?: {
-      adrs?: string[];
-      rfcs?: string[];
-      guides?: string[];
-      rules?: string[];
-      projects?: string[];
-      "depends-on"?: {
-        adrs?: string[];
-        rfcs?: string[];
-        guides?: string[];
-        rules?: string[];
-        projects?: string[];
-      };
-      supersedes?: {
-        adrs?: string[];
-        rfcs?: string[];
-        guides?: string[];
-        rules?: string[];
-        projects?: string[];
-      };
-    };
-  };
+  metadata: BaseMetadata;
 }
+
+interface Section {
+  title: string;
+  content: string;
+  type: string;
+}
+
+// Section type mapping for cleaner inference
+const SECTION_TYPE_PATTERNS: Record<string, RegExp> = {
+  context: /(context|problem|background|motivation|rationale|why)/i,
+  decision: /(decision|solution|approach|proposal|chosen)/i,
+  consequences: /(consequence|impact|tradeoff|implication|effect)/i,
+  alternatives: /(alternative|option|considered|comparison|rejected)/i,
+  implementation: /(implementation|plan|rollout|migration|deploy|schedule)/i,
+  summary: /(summary|overview|tldr|abstract|intro)/i,
+  metrics: /(metric|measure|success|criteria|kpi)/i,
+  risks: /(risk|concern|question|issue|challenge)/i,
+};
+
+const VALID_STATUSES: Record<DocumentType, string[]> = {
+  adr: ["draft", "accepted", "rejected", "deprecated", "superseded"],
+  rfc: ["draft", "review", "accepted", "rejected", "implemented"],
+  guide: [],
+  rule: [],
+  project: ["active", "inactive", "archived", "planning"],
+};
+
+const RELATED_KEYS = ["adrs", "rfcs", "guides", "rules", "projects"] as const;
+const SENTENCE_SPLIT_REGEX = /[^.!?\n]+(?:[.!?](?![\s\n])|[.!?](?=[\s\n](?:[A-Z]|$)))/g;
 
 export class DocumentProcessor {
   // Optimized for text-embedding-3-small (8191 token context)
@@ -92,13 +102,7 @@ export class DocumentProcessor {
 
   async processDocumentsToChunks(docsPath: string): Promise<DocumentChunk[]> {
     const documents = await this.processDocuments(docsPath);
-    const chunks: DocumentChunk[] = [];
-
-    for (const doc of documents) {
-      chunks.push(...doc.chunks);
-    }
-
-    return chunks;
+    return documents.flatMap((doc) => doc.chunks);
   }
 
   private async processDirectory(dirPath: string, documents: ProcessedDocument[]): Promise<void> {
@@ -130,10 +134,10 @@ export class DocumentProcessor {
       return null;
     }
 
-    const type = this.inferDocumentType(filePath, frontmatter);
+    const type = this.inferDocumentType(filePath);
     const id = this.generateDocumentId(filePath);
 
-    const baseMetadata = {
+    const baseMetadata: BaseMetadata = {
       title: this.extractTitle(frontmatter, filePath),
       type,
       tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : [],
@@ -153,11 +157,11 @@ export class DocumentProcessor {
     };
   }
 
-  private createDocumentChunks(documentId: string, content: string, baseMetadata: any): DocumentChunk[] {
+  private createDocumentChunks(documentId: string, content: string, baseMetadata: BaseMetadata): DocumentChunk[] {
     const sections = this.extractSections(content);
     const chunks: DocumentChunk[] = [];
-    let chunkIndex = 0;
 
+    let chunkIndex = 0;
     for (const section of sections) {
       const sectionChunks = this.chunkSection(section, documentId, chunkIndex, baseMetadata);
       chunks.push(...sectionChunks);
@@ -165,17 +169,17 @@ export class DocumentProcessor {
     }
 
     // Update totalChunks for all chunks
-    chunks.forEach((chunk) => {
-      chunk.metadata.totalChunks = chunks.length;
-    });
-
-    return chunks;
+    const totalChunks = chunks.length;
+    return chunks.map((chunk) => ({
+      ...chunk,
+      metadata: { ...chunk.metadata, totalChunks },
+    }));
   }
 
-  private extractSections(content: string): Array<{ title: string; content: string; type: string }> {
-    const sections: Array<{ title: string; content: string; type: string }> = [];
+  private extractSections(content: string): Section[] {
+    const sections: Section[] = [];
     const lines = content.split("\n");
-    let currentSection = { title: "", content: "", type: "content" };
+    let currentSection: Section = { title: "", content: "", type: "content" };
 
     for (const line of lines) {
       const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
@@ -186,12 +190,10 @@ export class DocumentProcessor {
         }
 
         const title = headingMatch[2];
-        const type = this.inferSectionType(title);
-
         currentSection = {
           title,
           content: line + "\n",
-          type,
+          type: this.inferSectionType(title),
         };
       } else {
         currentSection.content += line + "\n";
@@ -208,79 +210,53 @@ export class DocumentProcessor {
   private inferSectionType(title: string): string {
     const lower = title.toLowerCase();
 
-    // Context/Problem/Background
-    if (/(context|problem|background|motivation|rationale|why)/i.test(lower)) {
-      return "context";
-    }
-
-    // Decision/Solution/Approach
-    if (/(decision|solution|approach|proposal|chosen)/i.test(lower)) {
-      return "decision";
-    }
-
-    // Consequences/Impact/Trade-offs
-    if (/(consequence|impact|tradeoff|implication|effect)/i.test(lower)) {
-      return "consequences";
-    }
-
-    // Alternatives/Options
-    if (/(alternative|option|considered|comparison|rejected)/i.test(lower)) {
-      return "alternatives";
-    }
-
-    // Implementation/Plan/Rollout
-    if (/(implementation|plan|rollout|migration|deploy|schedule)/i.test(lower)) {
-      return "implementation";
-    }
-
-    // Summary/Overview
-    if (/(summary|overview|tldr|abstract|intro)/i.test(lower)) {
-      return "summary";
-    }
-
-    // Metrics/Success Criteria
-    if (/(metric|measure|success|criteria|kpi)/i.test(lower)) {
-      return "metrics";
-    }
-
-    // Risks/Concerns
-    if (/(risk|concern|question|issue|challenge)/i.test(lower)) {
-      return "risks";
+    for (const [type, pattern] of Object.entries(SECTION_TYPE_PATTERNS)) {
+      if (pattern.test(lower)) {
+        return type;
+      }
     }
 
     return "content";
   }
 
   private chunkSection(
-    section: { title: string; content: string; type: string },
+    section: Section,
     documentId: string,
     startIndex: number,
-    baseMetadata: any
+    baseMetadata: BaseMetadata
   ): DocumentChunk[] {
     const tokens = this.estimateTokens(section.content);
 
-    // If section fits in one chunk, return it with document title context
+    // If section fits in one chunk, return it
     if (tokens <= this.MAX_CHUNK_TOKENS) {
-      const contentWithContext = this.addDocumentContext(section.content, baseMetadata.title, section.title);
-
-      return [
-        {
-          id: `${documentId}_chunk_${startIndex}`,
-          content: contentWithContext,
-          metadata: {
-            ...baseMetadata,
-            chunkIndex: startIndex,
-            totalChunks: 0, // Updated later
-            sectionType: section.type,
-            sectionTitle: section.title,
-            tokens: this.estimateTokens(contentWithContext),
-          },
-        },
-      ];
+      return [this.createChunk(documentId, startIndex, section, baseMetadata, section.content)];
     }
 
     // Split large sections using sentence-aware strategy
     return this.splitLargeSectionSentenceAware(section, documentId, startIndex, baseMetadata);
+  }
+
+  private createChunk(
+    documentId: string,
+    chunkIndex: number,
+    section: Section,
+    baseMetadata: BaseMetadata,
+    content: string
+  ): DocumentChunk {
+    const contentWithContext = this.addDocumentContext(content, baseMetadata.title, section.title);
+
+    return {
+      id: `${documentId}_chunk_${chunkIndex}`,
+      content: contentWithContext,
+      metadata: {
+        ...baseMetadata,
+        chunkIndex,
+        totalChunks: 0, // Updated later
+        sectionType: section.type,
+        sectionTitle: section.title,
+        tokens: this.estimateTokens(contentWithContext),
+      },
+    };
   }
 
   private addDocumentContext(content: string, documentTitle: string, sectionTitle: string): string {
@@ -291,43 +267,28 @@ export class DocumentProcessor {
   }
 
   private splitLargeSectionSentenceAware(
-    section: { title: string; content: string; type: string },
+    section: Section,
     documentId: string,
     startIndex: number,
-    baseMetadata: any
+    baseMetadata: BaseMetadata
   ): DocumentChunk[] {
     const chunks: DocumentChunk[] = [];
-
-    // Split into sentences (handles common abbreviations)
     const sentences = this.splitIntoSentences(section.content);
 
     let currentChunk = "";
     let currentIndex = startIndex;
 
     for (const sentence of sentences) {
-      const testChunk = currentChunk ? currentChunk + " " + sentence : sentence;
+      const testChunk = currentChunk ? `${currentChunk} ${sentence}` : sentence;
       const testTokens = this.estimateTokens(testChunk);
 
       if (testTokens > this.MAX_CHUNK_TOKENS && currentChunk) {
-        // Save current chunk with document context
-        const contentWithContext = this.addDocumentContext(currentChunk, baseMetadata.title, section.title);
-
-        chunks.push({
-          id: `${documentId}_chunk_${currentIndex}`,
-          content: contentWithContext,
-          metadata: {
-            ...baseMetadata,
-            chunkIndex: currentIndex,
-            totalChunks: 0, // Updated later
-            sectionType: section.type,
-            sectionTitle: section.title,
-            tokens: this.estimateTokens(contentWithContext),
-          },
-        });
+        // Save current chunk
+        chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, currentChunk));
 
         // Start new chunk with overlap
         const overlapText = this.getLastNTokensOfText(currentChunk, this.OVERLAP_TOKENS);
-        currentChunk = overlapText + " " + sentence;
+        currentChunk = `${overlapText} ${sentence}`;
         currentIndex++;
       } else {
         currentChunk = testChunk;
@@ -336,43 +297,25 @@ export class DocumentProcessor {
 
     // Add final chunk
     if (currentChunk.trim()) {
-      const contentWithContext = this.addDocumentContext(currentChunk, baseMetadata.title, section.title);
-
-      chunks.push({
-        id: `${documentId}_chunk_${currentIndex}`,
-        content: contentWithContext,
-        metadata: {
-          ...baseMetadata,
-          chunkIndex: currentIndex,
-          totalChunks: 0, // Updated later
-          sectionType: section.type,
-          sectionTitle: section.title,
-          tokens: this.estimateTokens(contentWithContext),
-        },
-      });
+      chunks.push(this.createChunk(documentId, currentIndex, section, baseMetadata, currentChunk));
     }
 
     return chunks;
   }
 
   private splitIntoSentences(text: string): string[] {
-    // Split on sentence boundaries, handling common abbreviations
-    // Matches: . ! ? followed by space or newline
-    // Avoids splitting on: Dr. Mr. Ms. Mrs. vs. e.g. i.e. etc.
-    const sentences = text.match(/[^.!?\n]+(?:[.!?](?![\s\n])|[.!?](?=[\s\n](?:[A-Z]|$)))/g) || [text];
-
+    const sentences = text.match(SENTENCE_SPLIT_REGEX) || [text];
     return sentences.map((s) => s.trim()).filter((s) => s.length > 0);
   }
 
   private getLastNTokensOfText(text: string, maxTokens: number): string {
-    // Get last N tokens by estimating from the end
     const sentences = this.splitIntoSentences(text);
     let result = "";
     let tokens = 0;
 
     // Add sentences from the end until we reach maxTokens
     for (let i = sentences.length - 1; i >= 0 && tokens < maxTokens; i--) {
-      const testResult = sentences[i] + " " + result;
+      const testResult = `${sentences[i]} ${result}`;
       const testTokens = this.estimateTokens(testResult);
 
       if (testTokens > maxTokens) {
@@ -398,7 +341,7 @@ export class DocumentProcessor {
     return Math.ceil(text.length / 4);
   }
 
-  private inferDocumentType(filePath: string, _frontmatter: any): ProcessedDocument["metadata"]["type"] {
+  private inferDocumentType(filePath: string): DocumentType {
     const fileName = path.basename(filePath);
     const normalizedPath = filePath.replace(/\\/g, "/");
 
@@ -422,86 +365,80 @@ export class DocumentProcessor {
     return "guide";
   }
 
-  private extractProjectsArray(frontmatter: any, filePath: string): string[] {
+  private extractProjectsArray(frontmatter: Record<string, unknown>, filePath: string): string[] {
     // Check frontmatter first
-    if (frontmatter.related?.projects && Array.isArray(frontmatter.related.projects)) {
-      return frontmatter.related.projects;
+    const relatedProjects = (frontmatter.related as RelatedMetadata | undefined)?.projects;
+    if (Array.isArray(relatedProjects)) {
+      return relatedProjects;
     }
 
     // Extract from path
     const projectMatch = filePath.match(/\/projects\/([^\/]+)/);
-    if (projectMatch) {
-      return [projectMatch[1]];
-    }
-
-    return [];
+    return projectMatch ? [projectMatch[1]] : [];
   }
 
-  private validateRelatedMetadata(related: any): any {
-    const validatedRelated: any = {};
+  private validateRelatedMetadata(related: unknown): RelatedMetadata | undefined {
+    if (!related || typeof related !== "object") {
+      return undefined;
+    }
 
-    // Simple reference links
-    const allowedKeys = ["adrs", "rfcs", "guides", "rules", "projects"];
-    for (const key of allowedKeys) {
-      if (related[key] && Array.isArray(related[key])) {
-        validatedRelated[key] = related[key];
+    const relatedObj = related as Record<string, unknown>;
+    const validated: RelatedMetadata = {};
+
+    // Validate simple reference links
+    for (const key of RELATED_KEYS) {
+      const value = relatedObj[key];
+      if (Array.isArray(value)) {
+        validated[key] = value;
       }
     }
 
-    // Directed graph links: depends-on
-    if (related["depends-on"] && typeof related["depends-on"] === "object") {
-      const dependsOn: any = {};
-      for (const key of allowedKeys) {
-        if (related["depends-on"][key] && Array.isArray(related["depends-on"][key])) {
-          dependsOn[key] = related["depends-on"][key];
-        }
-      }
-      if (Object.keys(dependsOn).length > 0) {
-        validatedRelated["depends-on"] = dependsOn;
-      }
-    }
+    // Validate directed graph links: depends-on
+    validated["depends-on"] = this.validateDirectedLinks(relatedObj["depends-on"]);
 
-    // Directed graph links: supersedes
-    if (related["supersedes"] && typeof related["supersedes"] === "object") {
-      const supersedes: any = {};
-      for (const key of allowedKeys) {
-        if (related["supersedes"][key] && Array.isArray(related["supersedes"][key])) {
-          supersedes[key] = related["supersedes"][key];
-        }
-      }
-      if (Object.keys(supersedes).length > 0) {
-        validatedRelated["supersedes"] = supersedes;
-      }
-    }
+    // Validate directed graph links: supersedes
+    validated.supersedes = this.validateDirectedLinks(relatedObj["supersedes"]);
 
-    return validatedRelated;
+    return Object.keys(validated).length > 0 ? validated : undefined;
   }
 
-  private extractTitle(frontmatter: any, filePath: string): string {
+  private validateDirectedLinks(
+    links: unknown
+  ): RelatedMetadata["depends-on"] | RelatedMetadata["supersedes"] | undefined {
+    if (!links || typeof links !== "object") {
+      return undefined;
+    }
+
+    const linksObj = links as Record<string, unknown>;
+    const validated: Record<string, string[]> = {};
+
+    for (const key of RELATED_KEYS) {
+      const value = linksObj[key];
+      if (Array.isArray(value)) {
+        validated[key] = value;
+      }
+    }
+
+    return Object.keys(validated).length > 0 ? validated : undefined;
+  }
+
+  private extractTitle(frontmatter: Record<string, unknown>, filePath: string): string {
     // Priority: frontmatter.title > frontmatter.name > filename
-    if (frontmatter.title && typeof frontmatter.title === "string") {
+    if (typeof frontmatter.title === "string") {
       return frontmatter.title;
     }
-    if (frontmatter.name && typeof frontmatter.name === "string") {
+    if (typeof frontmatter.name === "string") {
       return frontmatter.name;
     }
     return path.basename(filePath, ".md");
   }
 
-  private validateStatus(status: any, type: ProcessedDocument["metadata"]["type"]): string | undefined {
+  private validateStatus(status: unknown, type: DocumentType): string | undefined {
     if (!status || typeof status !== "string") {
       return undefined;
     }
 
-    const validStatuses: Record<string, string[]> = {
-      adr: ["draft", "accepted", "rejected", "deprecated", "superseded"],
-      rfc: ["draft", "review", "accepted", "rejected", "implemented"],
-      guide: [],
-      rule: [],
-      project: ["active", "inactive", "archived", "planning"],
-    };
-
-    const allowedStatuses = validStatuses[type] || [];
+    const allowedStatuses = VALID_STATUSES[type];
     if (allowedStatuses.length === 0) {
       return status;
     }
